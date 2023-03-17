@@ -1,0 +1,74 @@
+name: Go
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v3
+      with:
+        go-version: 1.20
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Build and test
+        run: |
+          go mod download
+          go test -v ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o tcp-multiplexer-amd64 -ldflags="-w -s" .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -o tcp-multiplexer-darwin-amd64 -ldflags="-w -s" .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o tcp-multiplexer-amd64.exe -ldflags="-w -s" .
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.sha }}
+          release_name: Release ${{ github.sha }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Binaries to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: tcp-multiplexer-amd64
+          asset_name: tcp-multiplexer-amd64
+          asset_content_type: application/octet-stream
+
+      - name: Upload Binaries to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: tcp-multiplexer-darwin-amd64
+          asset_name: tcp-multiplexer-darwin-amd64
+          asset_content_type: application/octet-stream
+
+      - name: Upload Binaries to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: tcp-multiplexer-amd64.exe
+          asset_name: tcp-multiplexer-amd64.exe
+          asset_content_type: application/octet-stream
