@@ -119,18 +119,24 @@ func (c *Config) handleStream(stream quic.Stream, port string) {
 	}
 	log.Debug("Connected to ", zap.Stringer("remoteAddr", conn.RemoteAddr()), zap.Any("streamID", stream.StreamID()))
 	go func() {
-		_, err := io.Copy(conn, stream)
-		if err != nil {
-			log.Error("unable to copy client => server", zap.Error(err))
-			c.errChan <- err
+		for {
+			_, err := io.Copy(conn, stream)
+			if err != nil {
+				log.Error("unable to copy client => server", zap.Error(err))
+				c.errChan <- err
+				return
+			}
 		}
 	}()
 
 	go func() {
-		_, err := io.Copy(stream, conn)
-		if err != nil {
-			log.Error("unable to copy server => client", zap.Error(err))
-			c.errChan <- err
+		for {
+			_, err := io.Copy(stream, conn)
+			if err != nil {
+				log.Error("unable to copy server => client", zap.Error(err))
+				c.errChan <- err
+				return
+			}
 		}
 	}()
 
