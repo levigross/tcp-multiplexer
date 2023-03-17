@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"os/signal"
 
 	"github.com/levigross/logger/logger"
 	"github.com/levigross/tcp-multiplexer/pkg/crypto"
@@ -28,6 +30,10 @@ type Config struct {
 func (c *Config) StartQUICServer(ctx context.Context) (err error) {
 	c.errChan = make(chan error, 1)
 	c.done = make(chan struct{})
+
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt)
+
 	ctx, cancler := context.WithCancel(ctx)
 	defer cancler()
 
@@ -49,8 +55,10 @@ func (c *Config) StartQUICServer(ctx context.Context) (err error) {
 	case err := <-c.errChan:
 		close(c.done)
 		return err
+	case <-signalChan:
+		log.Info("Got SIGINT gracefully closing")
+		close(c.done)
 	}
-
 	return nil
 }
 
@@ -82,6 +90,7 @@ func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 			log.Error("Unable to unmarshal port list", zap.Error(err))
 			return err
 		}
+		log.Debug("Forwarding ports based map from client", zap.Any("portsToForward", portsToForward))
 		// We will just use the count and iterate through the IDs
 		for range portsToForward {
 			stream, err := conn.AcceptStream(ctx)
@@ -91,9 +100,13 @@ func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 			}
 			go c.handleStream(stream, portsToForward[stream.StreamID()])
 		}
-		select {}
+		log.Info("Finished Setting Up connections")
+		<-c.done
+		if err := l.Close(); err != nil {
+			log.Error("Unable to close connections", zap.Error(err))
+		}
+		return nil // Ignore the error because we are exiting anyways
 	}
-	return nil
 }
 
 // todo use context to cancel everything
@@ -104,6 +117,7 @@ func (c *Config) handleStream(stream quic.Stream, port string) {
 		c.errChan <- err
 		return
 	}
+	log.Debug("Connected to ", zap.Stringer("remoteAddr", conn.RemoteAddr()), zap.Any("streamID", stream.StreamID()))
 	go func() {
 		_, err := io.Copy(conn, stream)
 		if err != nil {
@@ -121,4 +135,5 @@ func (c *Config) handleStream(stream quic.Stream, port string) {
 	}()
 
 	<-c.done
+	log.Debug("Closing stream", zap.Error(stream.Close()), zap.Any("streamID", stream.StreamID()))
 }
