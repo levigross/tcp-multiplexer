@@ -9,9 +9,11 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 
 	"github.com/levigross/logger/logger"
 	"github.com/levigross/tcp-multiplexer/pkg/crypto"
+	"github.com/levigross/tcp-multiplexer/pkg/types"
 	"github.com/quic-go/quic-go"
 	"go.uber.org/zap"
 )
@@ -22,6 +24,8 @@ type Config struct {
 	KeyFile    string
 	CertFile   string
 	ListenAddr string
+
+	streamMap sync.Map
 
 	errChan chan error
 	done    chan struct{}
@@ -79,33 +83,45 @@ func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 			return err
 		}
 		log.Debug("Got QUIC connection", zap.String("remoteAddr", conn.RemoteAddr().String()))
-		portList, err := conn.ReceiveMessage()
+		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
-			log.Error("Unable to read portList message from client", zap.Error(err))
+			log.Error("Error in accepting stream", zap.Error(err))
 			return err
 		}
-		// The format of this map is streamID => port //todo add more than a 1:1 mapping
-		portsToForward := map[quic.StreamID]string{}
-		if err := json.Unmarshal(portList, &portsToForward); err != nil {
-			log.Error("Unable to unmarshal port list", zap.Error(err))
-			return err
-		}
-		log.Debug("Forwarding ports based map from client", zap.Any("portsToForward", portsToForward))
-		// We will just use the count and iterate through the IDs
-		for range portsToForward {
+		go c.handleControlStream(stream)
+
+		for {
 			stream, err := conn.AcceptStream(ctx)
 			if err != nil {
-				log.Error("Unable to accept stream from client", zap.Error(err))
+				log.Error("Error in accepting stream", zap.Error(err))
 				return err
 			}
-			go c.handleStream(stream, portsToForward[stream.StreamID()])
+			port, ok := c.streamMap.Load(stream.StreamID())
+			if !ok {
+				log.Error("Expected to find stream in stream map", zap.Any("streamID", stream.StreamID()))
+				return fmt.Errorf("unknown stream id %v", stream.StreamID())
+			}
+			go c.handleStream(stream, port.(string))
 		}
-		log.Info("Finished Setting Up connections")
-		<-c.done
-		if err := l.Close(); err != nil {
-			log.Error("Unable to close connections", zap.Error(err))
+	}
+}
+
+func (c *Config) handleControlStream(stream quic.Stream) {
+	jsonDecoder := json.NewDecoder(stream)
+	for {
+		var si types.StreamInfo
+		if err := jsonDecoder.Decode(&si); err != nil {
+			log.Error("Unable to decode JSON ", zap.Error(err))
+			c.errChan <- err
+			return
 		}
-		return nil // Ignore the error because we are exiting anyways
+		if _, err := stream.Write([]byte("OK")); err != nil {
+			log.Error("Unable to write response to client", zap.Error(err))
+			c.errChan <- err
+			return
+		}
+
+		c.streamMap.Store(si.QuicStreamID, si.Port)
 	}
 }
 
@@ -118,28 +134,30 @@ func (c *Config) handleStream(stream quic.Stream, port string) {
 		return
 	}
 	log.Debug("Connected to ", zap.Stringer("remoteAddr", conn.RemoteAddr()), zap.Any("streamID", stream.StreamID()))
+	done := make(chan struct{})
 	go func() {
-		for {
-			_, err := io.Copy(conn, stream)
-			if err != nil {
-				log.Error("unable to copy client => server", zap.Error(err))
-				c.errChan <- err
-				return
-			}
+		_, err := io.Copy(conn, stream)
+		if err != nil {
+			log.Error("unable to copy client => server", zap.Error(err))
+			c.errChan <- err
+			return
 		}
+		done <- struct{}{}
 	}()
 
 	go func() {
-		for {
-			_, err := io.Copy(stream, conn)
-			if err != nil {
-				log.Error("unable to copy server => client", zap.Error(err))
-				c.errChan <- err
-				return
-			}
+		_, err := io.Copy(stream, conn)
+		if err != nil {
+			log.Error("unable to copy server => client", zap.Error(err))
+			c.errChan <- err
+			return
 		}
+		done <- struct{}{}
 	}()
+	<-done
+	<-done
+	log.Debug("Closing stream", zap.Any("streamID", stream.StreamID()))
+	conn.Close()
+	stream.Close()
 
-	<-c.done
-	log.Debug("Closing stream", zap.Error(stream.Close()), zap.Any("streamID", stream.StreamID()))
 }
