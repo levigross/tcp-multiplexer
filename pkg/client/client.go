@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"time"
 
 	"github.com/levigross/logger/logger"
 	"github.com/levigross/tcp-multiplexer/pkg/types"
@@ -64,27 +65,6 @@ func (c *Config) Run(ctx context.Context) error {
 	for _, port := range c.PortsToForward {
 		go c.handleConnection(port)
 	}
-	// portsToForward := []{}
-	// portsToForward := map[quic.StreamID]string{}
-	// for _, port := range c.PortsToForward {
-	// 	stream, err := conn.OpenStream()
-	// 	if err != nil {
-	// 		log.Error("Unable to open stream to server", zap.Error(err))
-	// 		return err
-	// 	}
-	// 	portsToForward[stream.StreamID()] = port
-	// 	go c.handleStream(stream, port)
-	// }
-	// jsonBytes, err := json.Marshal(portsToForward)
-	// if err != nil {
-	// 	log.Error("unable to marshal portsToForward map", zap.Error(err))
-	// 	return err
-	// }
-
-	// if err := conn.SendMessage(jsonBytes); err != nil {
-	// 	log.Error("Unable to send inital message of how to forward the ports", zap.Error(err))
-	// 	return err
-	// }
 
 	close(c.doneSetup)
 	// todo handle graceful shutdown
@@ -99,11 +79,13 @@ func (c *Config) handleControlChannel(stream quic.Stream) {
 	for {
 		select {
 		case si := <-c.controlChannel:
+			log.Debug("Got a new connection", zap.Any("streamInfo", si))
 			if err := streamEncoder.Encode(si); err != nil {
 				log.Error("Error encoding JSON to send on control stream", zap.Error(err))
 				c.errChan <- err
 				return
 			}
+			log.Debug("Sent connection")
 			buf := make([]byte, 2)
 			if _, err := stream.Read(buf); err != nil {
 				log.Error("Unable to read response from server", zap.Error(err))
@@ -113,6 +95,7 @@ func (c *Config) handleControlChannel(stream quic.Stream) {
 			if !bytes.Equal(buf, []byte("OK")) {
 				log.Warn("Didn't get back heathly bytes", zap.Binary("returnBytes", buf))
 			}
+			log.Debug("Connection acked by the other side")
 			si.Done()
 		}
 	}
@@ -132,6 +115,7 @@ func (c *Config) handleConnection(port string) {
 			c.errChan <- err
 			return
 		}
+		log.Debug("New local connection received")
 		stream, err := c.quicConnection.OpenStream()
 		if err != nil {
 			log.Error("Unable open stream", zap.Error(err))
@@ -141,6 +125,7 @@ func (c *Config) handleConnection(port string) {
 		ts := types.NewStreamInfo(stream.StreamID(), port)
 		c.controlChannel <- ts
 		ts.Wait()
+		log.Debug("Server has stream information")
 		done := make(chan struct{})
 		go func() {
 			n, err := io.Copy(stream, conn)
@@ -150,6 +135,7 @@ func (c *Config) handleConnection(port string) {
 				return
 			}
 			log.Debug("Connection from conn => stream finished", zap.Int64("bytesTransferred", n))
+			time.AfterFunc(time.Second, func() { stream.Close() })
 			done <- struct{}{}
 		}()
 
@@ -167,5 +153,6 @@ func (c *Config) handleConnection(port string) {
 		<-done
 		stream.Close()
 		conn.Close()
+		log.Debug("All connections closed")
 	}
 }
