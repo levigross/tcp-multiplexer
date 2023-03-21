@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/levigross/logger/logger"
@@ -126,32 +128,47 @@ func (c *Config) handleConnection(port string) {
 		c.controlChannel <- ts
 		ts.Wait()
 		log.Debug("Server has stream information")
-		done := make(chan struct{})
+		wg := sync.WaitGroup{}
+		wg.Add(2)
 		go func() {
+			defer wg.Done()
 			n, err := io.Copy(stream, conn)
+			select {
+			case <-stream.Context().Done():
+				// we have been canceled
+				stream.Close()
+				conn.Close()
+				return
+			default:
+			}
 			if err != nil {
 				log.Error("Error in sending conn => stream", zap.Error(err))
 				c.errChan <- err
 				return
 			}
 			log.Debug("Connection from conn => stream finished", zap.Int64("bytesTransferred", n))
-			time.AfterFunc(time.Second, func() { stream.Close() }) // should we even wait?
-			done <- struct{}{}
+			time.AfterFunc(time.Second, func() { stream.CancelRead(123) }) // should we even wait?
 		}()
 
 		go func() {
+			defer wg.Done()
 			n, err := io.Copy(conn, stream)
+			streamErr, ok := errors.Unwrap(err).(*quic.StreamError)
+			if ok {
+				log.Debug("Connection from stream => conn finished", zap.Int64("bytesTransferred", n), zap.Error(streamErr))
+				time.AfterFunc(time.Second, func() {
+					conn.Close()
+					stream.CancelWrite(123)
+				}) // should we even wait?
+				return
+			}
 			if err != nil {
 				log.Error("Error in sending stream => conn", zap.Error(err))
 				c.errChan <- err
 				return
 			}
-			log.Debug("Connection from stream => conn finished", zap.Int64("bytesTransferred", n))
-			time.AfterFunc(time.Second, func() { conn.Close() }) // should we even wait?
-			done <- struct{}{}
 		}()
-		<-done // these should be a wait group
-		<-done
+		wg.Wait()
 		stream.Close()
 		conn.Close()
 		log.Debug("All connections closed")

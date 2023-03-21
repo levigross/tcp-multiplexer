@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/signal"
 	"sync"
+	"time"
 
 	"github.com/levigross/logger/logger"
 	"github.com/levigross/tcp-multiplexer/pkg/crypto"
@@ -134,30 +136,49 @@ func (c *Config) handleStream(stream quic.Stream, port string) {
 		return
 	}
 	log.Debug("Connected to ", zap.Stringer("remoteAddr", conn.RemoteAddr()), zap.Any("streamID", stream.StreamID()))
-	done := make(chan struct{})
+	wg := sync.WaitGroup{}
+	wg.Add(2)
 	go func() {
-		_, err := io.Copy(conn, stream)
+		defer wg.Done()
+		n, err := io.Copy(conn, stream)
+		streamErr, ok := errors.Unwrap(err).(*quic.StreamError)
+		if ok {
+			log.Debug("Connection from stream => conn finished", zap.Int64("bytesTransferred", n), zap.Error(streamErr))
+			time.AfterFunc(time.Second, func() {
+				conn.Close()
+				stream.CancelWrite(123)
+			}) // should we even wait?
+			return
+		}
 		if err != nil {
 			log.Error("unable to copy client => server", zap.Error(err))
 			c.errChan <- err
 			return
 		}
 		conn.Close()
-		done <- struct{}{}
+		log.Info("Ending stream => conn")
 	}()
 
 	go func() {
+		defer wg.Done()
 		_, err := io.Copy(stream, conn)
+		log.Info("Ending conn => stream")
+		select {
+		case <-stream.Context().Done():
+			// we have been canceled
+			stream.Close()
+			conn.Close()
+			return
+		default:
+		}
 		if err != nil {
 			log.Error("unable to copy server => client", zap.Error(err))
 			c.errChan <- err
 			return
 		}
-		stream.Close()
-		done <- struct{}{}
+		stream.CancelWrite(123)
 	}()
-	<-done
-	<-done
+	wg.Wait()
 	log.Debug("Closing stream", zap.Any("streamID", stream.StreamID()))
 	conn.Close()
 	stream.Close()
