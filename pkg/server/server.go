@@ -15,6 +15,7 @@ import (
 
 	"github.com/levigross/logger/logger"
 	"github.com/levigross/tcp-multiplexer/pkg/crypto"
+	"github.com/levigross/tcp-multiplexer/pkg/quicutils"
 	"github.com/levigross/tcp-multiplexer/pkg/types"
 	"github.com/quic-go/quic-go"
 	"go.uber.org/zap"
@@ -23,9 +24,11 @@ import (
 var log = logger.WithName("server")
 
 type Config struct {
-	KeyFile    string
-	CertFile   string
-	ListenAddr string
+	KeyFile           string
+	CertFile          string
+	ListenAddr        string
+	EnableQUICTracing bool
+	MaxIdleTimeout    time.Duration
 
 	streamMap sync.Map
 
@@ -56,7 +59,7 @@ func (c *Config) StartQUICServer(ctx context.Context) (err error) {
 
 	go func() { c.errChan <- c.serveQUIC(ctx, tlsConfig) }()
 
-	// todo clean up nicely
+	// todo clean up nicely using context
 	select {
 	case err := <-c.errChan:
 		close(c.done)
@@ -70,7 +73,12 @@ func (c *Config) StartQUICServer(ctx context.Context) (err error) {
 
 func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 	// todo change this to allow for connection IDS to be more meaningful
-	l, err := quic.ListenAddr(c.ListenAddr, tlsConfig, &quic.Config{EnableDatagrams: true})
+	qc := &quic.Config{EnableDatagrams: true, MaxIdleTimeout: c.MaxIdleTimeout}
+	if c.EnableQUICTracing {
+		qc.Tracer = quicutils.Tracer
+	}
+	log.Debug("Quic configured", zap.Any("quicConfig", qc))
+	l, err := quic.ListenAddr(c.ListenAddr, tlsConfig, qc)
 	if err != nil {
 		log.Error("Unable to create QUIC listener", zap.Error(err))
 		return err

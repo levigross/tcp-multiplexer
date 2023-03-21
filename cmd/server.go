@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"time"
 
 	"github.com/levigross/tcp-multiplexer/pkg/server"
 	"github.com/spf13/cobra"
@@ -24,4 +25,6 @@ func init() {
 	serverCmd.Flags().StringVar(&s.ListenAddr, "addr", "0.0.0.0:9119", "The inital port that the server should listen on")
 	serverCmd.Flags().StringVar(&s.CertFile, "cert", "", "The TLS cert file to use for the server (if this is not set, we will generate one internally")
 	serverCmd.Flags().StringVar(&s.KeyFile, "key", "", "The TLS key file to use for the server (if this is not set, we will generate one internally")
+	serverCmd.Flags().BoolVar(&s.EnableQUICTracing, "enable-quic-tracing", false, "Enable qlog tracing files to be written")
+	serverCmd.Flags().DurationVar(&s.MaxIdleTimeout, "max-idle-timeout", time.Second*120, "is the maximum duration that may pass without any incoming network activity - once this expires the connection will be closed")
 }

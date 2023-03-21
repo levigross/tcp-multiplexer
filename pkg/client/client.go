@@ -6,18 +6,15 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
 	"time"
 
 	"github.com/levigross/logger/logger"
+	"github.com/levigross/tcp-multiplexer/pkg/quicutils"
 	"github.com/levigross/tcp-multiplexer/pkg/types"
 	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/logging"
-	"github.com/quic-go/quic-go/qlog"
 	"go.uber.org/zap"
 )
 
@@ -27,6 +24,8 @@ type Config struct {
 	RemoteServer            string
 	PortsToForward          []string
 	IgnoreServerCertificate bool
+	EnableQUICTracing       bool
+	MaxIdleTimeout          time.Duration
 
 	controlChannel chan *types.StreamInfo
 	quicConnection quic.Connection
@@ -35,24 +34,18 @@ type Config struct {
 	doneSetup chan struct{}
 }
 
-func (c *Config) Run(ctx context.Context) error {
+func (c *Config) Run(ctx context.Context) (err error) {
 	c.errChan = make(chan error, 1)
 	c.doneSetup = make(chan struct{})
 	c.controlChannel = make(chan *types.StreamInfo)
 
 	log.Debug("Dialing client")
 	tlsConfig := &tls.Config{InsecureSkipVerify: c.IgnoreServerCertificate, NextProtos: []string{"quic"}}
-	tracer := qlog.NewTracer(func(_ logging.Perspective, connID []byte) io.WriteCloser {
-		filename := fmt.Sprintf("client_%x.qlog", connID)
-		f, err := os.Create(filename)
-		if err != nil {
-			log.Error("Unable to create file for tracing", zap.Error(err))
-		}
-		log.Debug("Creating qlog file", zap.String("qlogFile", filename))
-		return f
-	})
-	var err error
-	c.quicConnection, err = quic.DialAddrContext(ctx, c.RemoteServer, tlsConfig, &quic.Config{EnableDatagrams: true, Tracer: tracer})
+	cq := &quic.Config{EnableDatagrams: true, MaxIdleTimeout: c.MaxIdleTimeout}
+	if c.EnableQUICTracing {
+		cq.Tracer = quicutils.Tracer
+	}
+	c.quicConnection, err = quic.DialAddrContext(ctx, c.RemoteServer, tlsConfig, cq)
 	if err != nil {
 		log.Error("Unable to dial server", zap.Error(err))
 		return err
