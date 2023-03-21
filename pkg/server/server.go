@@ -142,6 +142,7 @@ func (c *Config) handleStream(stream quic.Stream, port string) {
 			c.errChan <- err
 			return
 		}
+		conn.Close()
 		done <- struct{}{}
 	}()
 
@@ -152,6 +153,7 @@ func (c *Config) handleStream(stream quic.Stream, port string) {
 			c.errChan <- err
 			return
 		}
+		stream.Close()
 		done <- struct{}{}
 	}()
 	<-done

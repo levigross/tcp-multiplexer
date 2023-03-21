@@ -147,6 +147,7 @@ func (c *Config) handleConnection(port string) {
 				return
 			}
 			log.Debug("Connection from stream => conn finished", zap.Int64("bytesTransferred", n))
+			time.AfterFunc(time.Second, func() { conn.Close() }) // should we even wait?
 			done <- struct{}{}
 		}()
 		<-done // these should be a wait group
