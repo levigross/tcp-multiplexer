@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/levigross/logger/logger"
+	"github.com/levigross/tcp-multiplexer/pkg/connection"
 	"github.com/levigross/tcp-multiplexer/pkg/crypto"
 	"github.com/levigross/tcp-multiplexer/pkg/jwtutil"
 	"github.com/levigross/tcp-multiplexer/pkg/quicutils"
@@ -38,6 +39,7 @@ type Config struct {
 
 	validationRegex *regexp.Regexp
 	auth            *jwtutil.Auth
+	tlsConfig       *tls.Config
 
 	streamMap sync.Map
 
@@ -52,44 +54,21 @@ func (c *Config) StartQUICServer(ctx context.Context) (err error) {
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt)
 
-	ctx, cancler := context.WithCancel(ctx)
+	ctx, cancler := context.WithCancel(ctx) // todo I need to do more with this context
 	defer cancler()
 
-	var tlsConfig *tls.Config
-	switch {
-	case c.KeyFile == "", c.CertFile == "":
-		tlsConfig, err = crypto.GenerateTLSConfigInMemory()
-	default:
-		tlsConfig, err = crypto.GenerateTLSConfigFromFile(c.KeyFile, c.CertFile)
+	if err := c.createTLSConfig(); err != nil {
+		return err
 	}
-	if err != nil {
-		return
-	}
+
 	if c.RequireAuth {
-		c.validationRegex, err = regexp.Compile(c.AuthMatchRegex)
-		if err != nil {
-			log.Error("Unable to compile auth regex")
-			return
+		if err := c.initAuthSubSystem(); err != nil {
+			return err
 		}
 
-		resp, err := http.Get(c.JWKUrl) // We should force TLS
-		if err != nil {
-			log.Error("Unable to fetch JWK url", zap.Error(err))
-			return err
-		}
-		respBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Error("Unable to read JWK request body", zap.Error(err))
-			return err
-		}
-		resp.Body.Close()
-		c.auth, err = jwtutil.NewAuth(respBytes)
-		if err != nil {
-			return err
-		}
 	}
 
-	go func() { c.errChan <- c.serveQUIC(ctx, tlsConfig) }()
+	go func() { c.errChan <- c.serveQUIC(ctx, c.tlsConfig) }()
 
 	// todo clean up nicely using context
 	select {
@@ -103,6 +82,41 @@ func (c *Config) StartQUICServer(ctx context.Context) (err error) {
 	return nil
 }
 
+func (c *Config) initAuthSubSystem() (err error) {
+	c.validationRegex, err = regexp.Compile(c.AuthMatchRegex)
+	if err != nil {
+		log.Error("Unable to compile auth regex")
+		return
+	}
+
+	resp, err := http.Get(c.JWKUrl) // We should force TLS
+	if err != nil {
+		log.Error("Unable to fetch JWK url", zap.Error(err))
+		return err
+	}
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Error("Unable to read JWK request body", zap.Error(err))
+		return err
+	}
+	resp.Body.Close()
+	c.auth, err = jwtutil.NewAuth(respBytes)
+	if err != nil {
+		return err
+	}
+	return
+}
+
+func (c *Config) createTLSConfig() (err error) {
+	switch {
+	case c.KeyFile == "", c.CertFile == "":
+		c.tlsConfig, err = crypto.GenerateTLSConfigInMemory()
+	default:
+		c.tlsConfig, err = crypto.GenerateTLSConfigFromFile(c.KeyFile, c.CertFile)
+	}
+	return
+}
+
 func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 	// todo change this to allow for connection IDS to be more meaningful
 	qc := &quic.Config{EnableDatagrams: true, MaxIdleTimeout: c.MaxIdleTimeout}
@@ -110,16 +124,17 @@ func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 		qc.Tracer = quicutils.Tracer
 	}
 	log.Debug("Quic configured", zap.Any("quicConfig", qc))
-	l, err := quic.ListenAddr(c.ListenAddr, tlsConfig, qc)
+
+	quicListener, err := quic.ListenAddr(c.ListenAddr, tlsConfig, qc)
 	if err != nil {
 		log.Error("Unable to create QUIC listener", zap.Error(err))
 		return err
 	}
 
-	log.Info("Listening for QUIC connections", zap.String("address", l.Addr().String()))
+	log.Info("Listening for QUIC connections", zap.String("address", quicListener.Addr().String()))
 
 	for {
-		conn, err := l.Accept(ctx)
+		conn, err := quicListener.Accept(ctx)
 		if err != nil {
 			log.Error("Unable to accept QUIC connection", zap.Error(err))
 			return err
@@ -130,6 +145,7 @@ func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 			log.Error("Error in accepting stream", zap.Error(err))
 			return err
 		}
+		authenticated := false
 		if c.RequireAuth {
 			ok, err := quicutils.ReceiveControlMessage(stream, c.validateAuthentication)
 			if err != nil {
@@ -141,10 +157,11 @@ func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 				continue
 			}
 			log.Info("Authentication Successful")
+			authenticated = true
 		}
-		go c.handleControlStream(stream)
-
-		for {
+		ch := connection.NewConnectionHandler(ctx, conn, authenticated)
+		go ch.HandleServerControlStream(stream)
+		for { // todo refactor to handle more than one client
 			stream, err := conn.AcceptStream(ctx)
 			if err != nil {
 				log.Error("Error in accepting stream", zap.Error(err))
@@ -176,32 +193,6 @@ func (c *Config) validateAuthentication(cm types.ControlMessage) (ok bool, err e
 	default:
 		log.Error("Stream info function called with unknown message type", zap.Any("controlMessage", cm))
 		return false, fmt.Errorf("unknown message type %v", cm)
-	}
-}
-
-func (c *Config) populateStreamInfo(cm types.ControlMessage) (bool, error) {
-	switch cm.MessageType {
-	case types.StreamInfoMessage: // These are the only messages we should be getting on a general basis
-		var si *types.StreamInfo
-		if err := json.Unmarshal(cm.Message, &si); err != nil {
-			log.Error("Unable to decode JSON ", zap.Error(err))
-			return false, err
-		}
-		c.streamMap.Store(si.QuicStreamID, si.Port)
-	default:
-		log.Error("Stream info function called with unknown message type", zap.Any("controlMessage", cm))
-		return false, fmt.Errorf("unknown message type %v", cm)
-	}
-	return true, nil
-}
-
-func (c *Config) handleControlStream(stream quic.Stream) {
-	for {
-		_, err := quicutils.ReceiveControlMessage(stream, c.populateStreamInfo)
-		if err != nil {
-			c.errChan <- err
-			return
-		}
 	}
 }
 
@@ -260,5 +251,4 @@ func (c *Config) handleStream(stream quic.Stream, port string) {
 	log.Debug("Closing stream", zap.Any("streamID", stream.StreamID()))
 	conn.Close()
 	stream.Close()
-
 }

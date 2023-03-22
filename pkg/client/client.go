@@ -116,7 +116,7 @@ func (c *Config) sendControlMessage(cm types.ControlMessage, stream quic.Stream)
 		log.Error("Unable to read response from server", zap.Error(err))
 		return
 	}
-	return bytes.Equal(buf, []byte("OK")), nil
+	return bytes.Equal(buf, []byte(types.OK)), nil
 }
 
 func (c *Config) handleControlChannel(stream quic.Stream) {
