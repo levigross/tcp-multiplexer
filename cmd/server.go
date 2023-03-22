@@ -27,4 +27,7 @@ func init() {
 	serverCmd.Flags().StringVar(&s.KeyFile, "key", "", "The TLS key file to use for the server (if this is not set, we will generate one internally")
 	serverCmd.Flags().BoolVar(&s.EnableQUICTracing, "enable-quic-tracing", false, "Enable qlog tracing files to be written")
 	serverCmd.Flags().DurationVar(&s.MaxIdleTimeout, "max-idle-timeout", time.Second*120, "is the maximum duration that may pass without any incoming network activity - once this expires the connection will be closed")
+	serverCmd.Flags().BoolVar(&s.RequireAuth, "require-auth", true, "Require authentication via a JWT")
+	serverCmd.Flags().StringVar(&s.JWKUrl, "jwk-url", "", "The URL for the JWK to validate the JWT auth")
+	serverCmd.Flags().StringVar(&s.AuthMatchRegex, "auth-match-regex", "", `The regex to match the "sub" field within the JWT`)
 }

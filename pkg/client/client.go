@@ -6,11 +6,14 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/levigross/logger/logger"
 	"github.com/levigross/tcp-multiplexer/pkg/quicutils"
 	"github.com/levigross/tcp-multiplexer/pkg/types"
@@ -26,6 +29,9 @@ type Config struct {
 	IgnoreServerCertificate bool
 	EnableQUICTracing       bool
 	MaxIdleTimeout          time.Duration
+	JWTFile                 string
+
+	jwt *jwt.JSONWebToken
 
 	controlChannel chan *types.StreamInfo
 	quicConnection quic.Connection
@@ -38,6 +44,19 @@ func (c *Config) Run(ctx context.Context) (err error) {
 	c.errChan = make(chan error, 1)
 	c.doneSetup = make(chan struct{})
 	c.controlChannel = make(chan *types.StreamInfo)
+
+	if c.JWTFile != "" {
+		f, err := os.ReadFile(c.JWTFile)
+		if err != nil {
+			log.Error("Unable to open JWT file", zap.Error(err))
+			return err
+		}
+		c.jwt, err = jwt.ParseSigned(string(f))
+		if err != nil {
+			log.Error("Unable to parse JWT file", zap.Error(err))
+			return err
+		}
+	}
 
 	log.Debug("Dialing client")
 	tlsConfig := &tls.Config{InsecureSkipVerify: c.IgnoreServerCertificate, NextProtos: []string{"quic"}}
@@ -56,6 +75,22 @@ func (c *Config) Run(ctx context.Context) (err error) {
 		log.Error("Unable to open stream", zap.Error(err))
 		return err
 	}
+	if c.jwt != nil { // we pass in an auth token
+		jwtBytes, err := json.Marshal(types.Auth{JWT: c.jwt})
+		if err != nil {
+			log.Error("Unable to marshal JWT", zap.Error(err))
+			return err
+		}
+		am := types.ControlMessage{MessageType: types.AuthMessage, Message: jwtBytes}
+		ok, err := c.sendControlMessage(am, stream)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			log.Error("Auth Failed -- see server for details")
+			return fmt.Errorf("authentication failure")
+		}
+	}
 	go c.handleControlChannel(stream)
 	for _, port := range c.PortsToForward {
 		go c.handleConnection(port)
@@ -69,26 +104,40 @@ func (c *Config) Run(ctx context.Context) (err error) {
 	}
 }
 
-func (c *Config) handleControlChannel(stream quic.Stream) {
+func (c *Config) sendControlMessage(cm types.ControlMessage, stream quic.Stream) (success bool, err error) {
 	streamEncoder := json.NewEncoder(stream)
+	if err = streamEncoder.Encode(cm); err != nil {
+		log.Error("Unable to encode object to stream", zap.Any("controlMessage", cm), zap.Error(err))
+		return
+	}
+
+	buf := make([]byte, 2)
+	if _, err = stream.Read(buf); err != nil {
+		log.Error("Unable to read response from server", zap.Error(err))
+		return
+	}
+	return bytes.Equal(buf, []byte("OK")), nil
+}
+
+func (c *Config) handleControlChannel(stream quic.Stream) {
 	for {
 		select {
 		case si := <-c.controlChannel:
 			log.Debug("Got a new connection", zap.Any("streamInfo", si))
-			if err := streamEncoder.Encode(si); err != nil {
+			b, err := json.Marshal(si)
+			if err != nil {
 				log.Error("Error encoding JSON to send on control stream", zap.Error(err))
 				c.errChan <- err
 				return
 			}
-			log.Debug("Sent connection")
-			buf := make([]byte, 2)
-			if _, err := stream.Read(buf); err != nil {
-				log.Error("Unable to read response from server", zap.Error(err))
+			cm := types.ControlMessage{MessageType: types.StreamInfoMessage, Message: b}
+			ok, err := c.sendControlMessage(cm, stream)
+			if err != nil {
 				c.errChan <- err
 				return
 			}
-			if !bytes.Equal(buf, []byte("OK")) {
-				log.Warn("Didn't get back heathly bytes", zap.Binary("returnBytes", buf))
+			if !ok {
+				log.Warn("Connection wasn't ACKed by the other side, this may not work")
 			}
 			log.Debug("Connection acked by the other side")
 			si.Done()

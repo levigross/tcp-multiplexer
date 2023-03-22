@@ -8,13 +8,16 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/levigross/logger/logger"
 	"github.com/levigross/tcp-multiplexer/pkg/crypto"
+	"github.com/levigross/tcp-multiplexer/pkg/jwtutil"
 	"github.com/levigross/tcp-multiplexer/pkg/quicutils"
 	"github.com/levigross/tcp-multiplexer/pkg/types"
 	"github.com/quic-go/quic-go"
@@ -29,6 +32,12 @@ type Config struct {
 	ListenAddr        string
 	EnableQUICTracing bool
 	MaxIdleTimeout    time.Duration
+	JWKUrl            string
+	RequireAuth       bool
+	AuthMatchRegex    string
+
+	validationRegex *regexp.Regexp
+	auth            *jwtutil.Auth
 
 	streamMap sync.Map
 
@@ -55,6 +64,29 @@ func (c *Config) StartQUICServer(ctx context.Context) (err error) {
 	}
 	if err != nil {
 		return
+	}
+	if c.RequireAuth {
+		c.validationRegex, err = regexp.Compile(c.AuthMatchRegex)
+		if err != nil {
+			log.Error("Unable to compile auth regex")
+			return
+		}
+
+		resp, err := http.Get(c.JWKUrl) // We should force TLS
+		if err != nil {
+			log.Error("Unable to fetch JWK url", zap.Error(err))
+			return err
+		}
+		respBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Error("Unable to read JWK request body", zap.Error(err))
+			return err
+		}
+		resp.Body.Close()
+		c.auth, err = jwtutil.NewAuth(respBytes)
+		if err != nil {
+			return err
+		}
 	}
 
 	go func() { c.errChan <- c.serveQUIC(ctx, tlsConfig) }()
@@ -98,6 +130,18 @@ func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 			log.Error("Error in accepting stream", zap.Error(err))
 			return err
 		}
+		if c.RequireAuth {
+			ok, err := quicutils.ReceiveControlMessage(stream, c.validateAuthentication)
+			if err != nil {
+				conn.CloseWithError(quic.ApplicationErrorCode(types.AuthError), err.Error())
+				continue
+			}
+			if !ok {
+				conn.CloseWithError(quic.ApplicationErrorCode(types.BadAuth), err.Error())
+				continue
+			}
+			log.Info("Authentication Successful")
+		}
 		go c.handleControlStream(stream)
 
 		for {
@@ -116,22 +160,48 @@ func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 	}
 }
 
-func (c *Config) handleControlStream(stream quic.Stream) {
-	jsonDecoder := json.NewDecoder(stream)
-	for {
-		var si types.StreamInfo
-		if err := jsonDecoder.Decode(&si); err != nil {
+func (c *Config) validateAuthentication(cm types.ControlMessage) (ok bool, err error) {
+	switch cm.MessageType {
+	case types.AuthMessage: // These are the only messages we should be getting on a general basis
+		var authMessage *types.Auth
+		if err := json.Unmarshal(cm.Message, &authMessage); err != nil {
 			log.Error("Unable to decode JSON ", zap.Error(err))
-			c.errChan <- err
-			return
+			return false, err
 		}
-		if _, err := stream.Write([]byte("OK")); err != nil {
-			log.Error("Unable to write response to client", zap.Error(err))
-			c.errChan <- err
-			return
+		sub, err := c.auth.ValidateJWT(authMessage.JWT)
+		if err != nil {
+			return false, err
 		}
+		return c.validationRegex.MatchString(sub), nil
+	default:
+		log.Error("Stream info function called with unknown message type", zap.Any("controlMessage", cm))
+		return false, fmt.Errorf("unknown message type %v", cm)
+	}
+}
 
+func (c *Config) populateStreamInfo(cm types.ControlMessage) (bool, error) {
+	switch cm.MessageType {
+	case types.StreamInfoMessage: // These are the only messages we should be getting on a general basis
+		var si *types.StreamInfo
+		if err := json.Unmarshal(cm.Message, &si); err != nil {
+			log.Error("Unable to decode JSON ", zap.Error(err))
+			return false, err
+		}
 		c.streamMap.Store(si.QuicStreamID, si.Port)
+	default:
+		log.Error("Stream info function called with unknown message type", zap.Any("controlMessage", cm))
+		return false, fmt.Errorf("unknown message type %v", cm)
+	}
+	return true, nil
+}
+
+func (c *Config) handleControlStream(stream quic.Stream) {
+	for {
+		_, err := quicutils.ReceiveControlMessage(stream, c.populateStreamInfo)
+		if err != nil {
+			c.errChan <- err
+			return
+		}
 	}
 }
 
