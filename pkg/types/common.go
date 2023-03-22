@@ -16,6 +16,8 @@ const (
 	AuthError = 321
 	BadAuth   = 911
 
+	CancelAuthCode = 123
+
 	AuthMessage ControlMessageType = iota
 	StreamInfoMessage
 )
