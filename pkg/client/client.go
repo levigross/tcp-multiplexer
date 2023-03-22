@@ -4,10 +4,16 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"io"
-	"net"
+	"fmt"
+	"os"
+	"os/signal"
+	"time"
 
+	"github.com/go-jose/go-jose/v3/jwt"
 	"github.com/levigross/logger/logger"
+	"github.com/levigross/tcp-multiplexer/pkg/connection"
+	"github.com/levigross/tcp-multiplexer/pkg/quicutils"
+	"github.com/levigross/tcp-multiplexer/pkg/types"
 	"github.com/quic-go/quic-go"
 	"go.uber.org/zap"
 )
@@ -18,81 +24,78 @@ type Config struct {
 	RemoteServer            string
 	PortsToForward          []string
 	IgnoreServerCertificate bool
+	EnableQUICTracing       bool
+	MaxIdleTimeout          time.Duration
+	JWTFile                 string
 
-	errChan   chan error
-	doneSetup chan struct{}
+	jwt *jwt.JSONWebToken
+
+	errChan chan error
 }
 
-func (c *Config) Run(ctx context.Context) error {
+func (c *Config) Run(ctx context.Context) (err error) {
 	c.errChan = make(chan error, 1)
-	c.doneSetup = make(chan struct{})
+
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt)
+
+	ctx, cancler := context.WithCancel(ctx) // todo I need to do more with this context
+	defer cancler()
+
+	if c.JWTFile != "" {
+		f, err := os.ReadFile(c.JWTFile)
+		if err != nil {
+			log.Error("Unable to open JWT file", zap.Error(err))
+			return err
+		}
+		c.jwt, err = jwt.ParseSigned(string(f))
+		if err != nil {
+			log.Error("Unable to parse JWT file", zap.Error(err))
+			return err
+		}
+	}
+
 	log.Debug("Dialing client")
-	tlsConfig := &tls.Config{InsecureSkipVerify: c.IgnoreServerCertificate, NextProtos: []string{"quic"}}
-	conn, err := quic.DialAddrContext(ctx, c.RemoteServer, tlsConfig, &quic.Config{EnableDatagrams: true})
+	tlsConfig := &tls.Config{InsecureSkipVerify: c.IgnoreServerCertificate, NextProtos: []string{"quic"}} // TODO: support MTLS
+	cq := &quic.Config{EnableDatagrams: true, MaxIdleTimeout: c.MaxIdleTimeout}
+	if c.EnableQUICTracing {
+		cq.Tracer = quicutils.Tracer
+	}
+	quicConnection, err := quic.DialAddrContext(ctx, c.RemoteServer, tlsConfig, cq)
 	if err != nil {
 		log.Error("Unable to dial server", zap.Error(err))
 		return err
 	}
 	log.Debug("Connected to client")
-	portsToForward := map[quic.StreamID]string{}
-	for _, port := range c.PortsToForward {
-		stream, err := conn.OpenStream()
+	stream, err := quicConnection.OpenStreamSync(ctx)
+	if err != nil {
+		log.Error("Unable to open stream", zap.Error(err))
+		return err
+	}
+	isAuthenticated := false
+	if c.jwt != nil { // we pass in an auth token
+		jwtBytes, err := json.Marshal(types.Auth{JWT: c.jwt})
 		if err != nil {
-			log.Error("Unable to open stream to server", zap.Error(err))
+			log.Error("Unable to marshal JWT", zap.Error(err))
 			return err
 		}
-		portsToForward[stream.StreamID()] = port
-		go c.handleStream(stream, port)
+		ok, err := quicutils.SendControlMessage(types.ControlMessage{MessageType: types.AuthMessage, Message: jwtBytes}, stream)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			log.Error("Auth Failed -- see server logs for details")
+			return fmt.Errorf("authentication failure")
+		}
 	}
-	jsonBytes, err := json.Marshal(portsToForward)
-	if err != nil {
-		log.Error("unable to marshal portsToForward map", zap.Error(err))
-		return err
-	}
-
-	if err := conn.SendMessage(jsonBytes); err != nil {
-		log.Error("Unable to send inital message of how to forward the ports", zap.Error(err))
-		return err
-	}
-
-	close(c.doneSetup)
+	ch := connection.NewConnectionHandler(ctx, quicConnection, isAuthenticated)
+	go ch.ClientHandler(stream, c.PortsToForward)
 	// todo handle graceful shutdown
 	select {
+	case <-signalChan:
+		log.Info("Got SIGINT") // todo: Close gracefully
+		return
 	case err := <-c.errChan:
 		return err
-	}
-}
-
-func (c *Config) handleStream(stream quic.Stream, port string) {
-	<-c.doneSetup
-	l, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		log.Error("Unable to listen on port", zap.String("port", port), zap.Error(err))
-		c.errChan <- err
-		return
-	}
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			log.Error("Unable to accept connection on port", zap.String("port", port), zap.Error(err))
-			c.errChan <- err
-			return
-		}
-
-		go func() {
-			_, err := io.Copy(conn, stream)
-			if err != nil {
-				log.Error("unable to copy server => client", zap.Error(err))
-				c.errChan <- err
-			}
-		}()
-
-		go func() {
-			_, err := io.Copy(stream, conn)
-			if err != nil {
-				log.Error("unable to copy client => server", zap.Error(err))
-				c.errChan <- err
-			}
-		}()
 	}
 }

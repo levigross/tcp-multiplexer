@@ -6,12 +6,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"time"
 
 	"github.com/levigross/logger/logger"
+	"github.com/levigross/tcp-multiplexer/pkg/connection"
 	"github.com/levigross/tcp-multiplexer/pkg/crypto"
+	"github.com/levigross/tcp-multiplexer/pkg/jwtutil"
+	"github.com/levigross/tcp-multiplexer/pkg/quicutils"
+	"github.com/levigross/tcp-multiplexer/pkg/types"
 	"github.com/quic-go/quic-go"
 	"go.uber.org/zap"
 )
@@ -19,9 +25,18 @@ import (
 var log = logger.WithName("server")
 
 type Config struct {
-	KeyFile    string
-	CertFile   string
-	ListenAddr string
+	KeyFile           string
+	CertFile          string
+	ListenAddr        string
+	EnableQUICTracing bool
+	MaxIdleTimeout    time.Duration
+	JWKUrl            string
+	RequireAuth       bool
+	AuthMatchRegex    string
+
+	validationRegex *regexp.Regexp
+	auth            *jwtutil.Auth
+	tlsConfig       *tls.Config
 
 	errChan chan error
 	done    chan struct{}
@@ -34,112 +49,132 @@ func (c *Config) StartQUICServer(ctx context.Context) (err error) {
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt)
 
-	ctx, cancler := context.WithCancel(ctx)
+	ctx, cancler := context.WithCancel(ctx) // todo I need to do more with this context
 	defer cancler()
 
-	var tlsConfig *tls.Config
-	switch {
-	case c.KeyFile == "", c.CertFile == "":
-		tlsConfig, err = crypto.GenerateTLSConfigInMemory()
-	default:
-		tlsConfig, err = crypto.GenerateTLSConfigFromFile(c.KeyFile, c.CertFile)
-	}
-	if err != nil {
-		return
+	if err := c.createTLSConfig(); err != nil {
+		return err
 	}
 
-	go func() { c.errChan <- c.serveQUIC(ctx, tlsConfig) }()
+	if c.RequireAuth {
+		if err := c.initAuthSubSystem(); err != nil {
+			return err
+		}
 
-	// todo clean up nicely
+	}
+
+	go func() { c.errChan <- c.serveQUIC(ctx, c.tlsConfig) }()
+
+	// todo clean up nicely using context
 	select {
 	case err := <-c.errChan:
 		close(c.done)
 		return err
 	case <-signalChan:
-		log.Info("Got SIGINT gracefully closing")
+		log.Info("Got SIGINT") // todo: Close gracefully
 		close(c.done)
 	}
 	return nil
 }
 
+func (c *Config) initAuthSubSystem() (err error) {
+	c.validationRegex, err = regexp.Compile(c.AuthMatchRegex)
+	if err != nil {
+		log.Error("Unable to compile auth regex")
+		return
+	}
+
+	resp, err := http.Get(c.JWKUrl) // TODO: We should force TLS
+	if err != nil {
+		log.Error("Unable to fetch JWK url", zap.Error(err))
+		return err
+	}
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Error("Unable to read JWK request body", zap.Error(err))
+		return err
+	}
+	resp.Body.Close()
+	c.auth, err = jwtutil.NewAuth(respBytes)
+	if err != nil {
+		return err
+	}
+	return
+}
+
+func (c *Config) createTLSConfig() (err error) {
+	switch {
+	case c.KeyFile == "", c.CertFile == "":
+		c.tlsConfig, err = crypto.GenerateTLSConfigInMemory()
+	default:
+		c.tlsConfig, err = crypto.GenerateTLSConfigFromFile(c.KeyFile, c.CertFile)
+	}
+	return
+}
+
 func (c *Config) serveQUIC(ctx context.Context, tlsConfig *tls.Config) error {
 	// todo change this to allow for connection IDS to be more meaningful
-	l, err := quic.ListenAddr(c.ListenAddr, tlsConfig, &quic.Config{EnableDatagrams: true})
+	qc := &quic.Config{EnableDatagrams: true, MaxIdleTimeout: c.MaxIdleTimeout}
+	if c.EnableQUICTracing {
+		qc.Tracer = quicutils.Tracer
+	}
+	log.Debug("Quic configured", zap.Any("quicConfig", qc))
+
+	quicListener, err := quic.ListenAddr(c.ListenAddr, tlsConfig, qc)
 	if err != nil {
 		log.Error("Unable to create QUIC listener", zap.Error(err))
 		return err
 	}
 
-	log.Info("Listening for QUIC connections", zap.String("address", l.Addr().String()))
+	log.Info("Listening for QUIC connections", zap.String("address", quicListener.Addr().String()))
 
 	for {
-		conn, err := l.Accept(ctx)
+		conn, err := quicListener.Accept(ctx)
 		if err != nil {
 			log.Error("Unable to accept QUIC connection", zap.Error(err))
 			return err
 		}
 		log.Debug("Got QUIC connection", zap.String("remoteAddr", conn.RemoteAddr().String()))
-		portList, err := conn.ReceiveMessage()
+		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
-			log.Error("Unable to read portList message from client", zap.Error(err))
+			log.Error("Error in accepting stream", zap.Error(err))
 			return err
 		}
-		// The format of this map is streamID => port //todo add more than a 1:1 mapping
-		portsToForward := map[quic.StreamID]string{}
-		if err := json.Unmarshal(portList, &portsToForward); err != nil {
-			log.Error("Unable to unmarshal port list", zap.Error(err))
-			return err
-		}
-		log.Debug("Forwarding ports based map from client", zap.Any("portsToForward", portsToForward))
-		// We will just use the count and iterate through the IDs
-		for range portsToForward {
-			stream, err := conn.AcceptStream(ctx)
+		authenticated := false
+		if c.RequireAuth { // TODO: Add MTLS as an auth option
+			ok, err := quicutils.ReceiveControlMessage(stream, c.validateAuthentication)
 			if err != nil {
-				log.Error("Unable to accept stream from client", zap.Error(err))
-				return err
+				conn.CloseWithError(quic.ApplicationErrorCode(types.AuthError), err.Error())
+				continue
 			}
-			go c.handleStream(stream, portsToForward[stream.StreamID()])
+			if !ok {
+				conn.CloseWithError(quic.ApplicationErrorCode(types.BadAuth), err.Error())
+				continue
+			}
+			log.Info("Authentication Successful")
+			authenticated = true
 		}
-		log.Info("Finished Setting Up connections")
-		<-c.done
-		if err := l.Close(); err != nil {
-			log.Error("Unable to close connections", zap.Error(err))
-		}
-		return nil // Ignore the error because we are exiting anyways
+		ch := connection.NewConnectionHandler(ctx, conn, authenticated)
+		go ch.HandleServerControlStream(stream)
+		go ch.ConnectionHandler()
 	}
 }
 
-// todo use context to cancel everything
-func (c *Config) handleStream(stream quic.Stream, port string) {
-	conn, err := net.Dial("tcp", fmt.Sprintf(":%v", port))
-	if err != nil {
-		log.Error("Unable to dial out to local port", zap.String("port", port), zap.Error(err))
-		c.errChan <- err
-		return
+func (c *Config) validateAuthentication(cm types.ControlMessage) (ok bool, err error) {
+	switch cm.MessageType {
+	case types.AuthMessage: // These are the only messages we should be getting on a general basis
+		var authMessage *types.Auth
+		if err := json.Unmarshal(cm.Message, &authMessage); err != nil {
+			log.Error("Unable to decode JSON ", zap.Error(err))
+			return false, err
+		}
+		sub, err := c.auth.ValidateJWT(authMessage.JWT)
+		if err != nil {
+			return false, err
+		}
+		return c.validationRegex.MatchString(sub), nil
+	default:
+		log.Error("Stream info function called with unknown message type", zap.Any("controlMessage", cm))
+		return false, fmt.Errorf("unknown message type %v", cm)
 	}
-	log.Debug("Connected to ", zap.Stringer("remoteAddr", conn.RemoteAddr()), zap.Any("streamID", stream.StreamID()))
-	go func() {
-		for {
-			_, err := io.Copy(conn, stream)
-			if err != nil {
-				log.Error("unable to copy client => server", zap.Error(err))
-				c.errChan <- err
-				return
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			_, err := io.Copy(stream, conn)
-			if err != nil {
-				log.Error("unable to copy server => client", zap.Error(err))
-				c.errChan <- err
-				return
-			}
-		}
-	}()
-
-	<-c.done
-	log.Debug("Closing stream", zap.Error(stream.Close()), zap.Any("streamID", stream.StreamID()))
 }
